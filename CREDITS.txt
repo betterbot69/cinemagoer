@@ -1,0 +1,23 @@
+First of all, I want to thank all the package maintainers, and especially
+Ana Guerrero. Another big thanks to the developers who used Cinemagoer
+for their projects and research; they can be found here:
+https://cinemagoer.github.io/ecosystem/
+
+Other very special thanks go to some people who followed the development
+of Cinemagoer very closely, providing hints and insights: Ori Cohen, James Rubino,
+Tero Saarni, and Jesper Noer (for a lot of help, and also for the wonderful
+https://bitbucket.org/); and let's not forget all the translators
+on https://www.transifex.com/davide_alberani/imdbpy/
+
+The list of people contributing to Cinemagoer is getting too long, so
+starting from 20221222 we no longer add people to the list; see https://github.com/cinemagoer/cinemagoer/graphs/contributors
+for a complete list of contributors.
+
+
+We'd like to thank the following people for their donations:
+
+- Paulina Wadecka
+- Oleg Peil
+- Diego Sarmentero
+- Fabian Winter
+- Lacroix Scott
