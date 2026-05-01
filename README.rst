@@ -12,6 +12,38 @@
     :target: https://github.com/cinemagoer/cinemagoer/blob/master/LICENSE.txt
     :alt: Project license.
 
+# Cinemagoer Fork
+
+> ⚠️ **Notice**
+>
+> This repository is a fork of the original **Cinemagoer** project.
+>
+> Original repository: https://github.com/cinemagoer/cinemagoer
+>
+> All original credits belong to the Cinemagoer maintainers and contributors.
+
+## 🔧 What Is Updated In This Fork?
+
+This fork includes an unofficial IMDb GraphQL fallback for basic movie metadata when IMDb HTML pages are blocked by AWS WAF.
+
+The fallback helps retrieve fields such as:
+
+- title
+- year
+- poster
+- rating
+- votes
+- genres
+- languages
+- runtime
+- plot
+
+## ⚠️ Important Note
+
+IMDb GraphQL is not an official stable public API. It may change, stop working, or get blocked at any time.
+
+Use this fork at your own risk and review IMDb's terms/disclaimer before public or commercial use.
+
 
 **Cinemagoer** (previously known as *IMDbPY*) is a Python package for retrieving and managing the data
 of the `IMDb`_ movie database about movies, people and companies.
@@ -49,7 +81,7 @@ Installation
 
 Whenever possible, please use the latest version from the repository::
 
-   pip install git+https://github.com/cinemagoer/cinemagoer
+   pip install git+https://github.com/betterbot69/cinemagoer
 
 
 But if you want, you can also install the latest release from PyPI::
