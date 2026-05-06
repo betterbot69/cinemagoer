@@ -28,15 +28,16 @@ This fork includes an unofficial IMDb GraphQL fallback for basic movie metadata 
 
 The fallback helps retrieve fields such as:
 
-- title
-- year
-- poster
-- rating
-- votes
-- genres
-- languages
-- runtime
+- movie search/basic lookup
+- title, year, poster
+- rating and votes
+- genres, languages, runtime
 - plot
+- AKAs
+- trivia
+- reviews
+- parental guide
+- person filmography
 
 ## ⚠️ Important Note
 
