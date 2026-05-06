@@ -61,6 +61,9 @@ from . import (
 # Logger for miscellaneous functions.
 _aux_logger = logger.getChild('aux')
 
+# Set this to False to test GraphQL search results without IMDb suggestion JSON.
+USE_IMDB_SUGGESTION_SEARCH = True
+
 
 class _ModuleProxy:
     """A proxy to instantiate and access parsers."""
@@ -457,6 +460,111 @@ class IMDbHTTPAccessSystem(IMDbBase):
             elif kind == 'co':
                 parsed.append((imdb_id[2:], analyze_company_name(label)))
 
+            if len(parsed) >= results:
+                break
+        return parsed
+
+    def _search_graphql(self, query_text, kind, results):
+        """Fallback search using IMDb's GraphQL mainSearch endpoint."""
+        search_types = {'tt': 'TITLE', 'nm': 'NAME'}.get(kind)
+        if not search_types:
+            return []
+        query = """
+        query {
+          mainSearch(
+            first: %d
+            options: {
+              searchTerm: %s
+              isExactMatch: false
+              type: [%s]
+              titleSearchOptions: { type: [] }
+            }
+          ) {
+            edges {
+              node {
+                entity {
+                  ... on Title {
+                    __typename
+                    id
+                    titleText { text }
+                    originalTitleText { text }
+                    releaseYear { year }
+                    releaseDate { year month day }
+                    primaryImage { url }
+                    titleType { id text }
+                    ratingsSummary { aggregateRating }
+                    runtime { seconds }
+                  }
+                  ... on Name {
+                    __typename
+                    id
+                    nameText { text }
+                    primaryImage { url }
+                    knownForV2 {
+                      credits {
+                        title { titleText { text } releaseYear { year } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """ % (max(results, 1), json.dumps(query_text), search_types)
+        payload = self._post_graphql(query, query_text)
+        edges = (((payload.get('data') or {}).get('mainSearch') or {}).get('edges') or [])
+        parsed = []
+        kind_map = {
+            'movie': 'movie',
+            'tvMovie': 'tv movie',
+            'tvSeries': 'tv series',
+            'tvMiniSeries': 'tv mini series',
+            'tvEpisode': 'episode',
+            'video': 'video movie',
+            'videoGame': 'video game',
+            'short': 'short',
+        }
+        for edge in edges:
+            entity = ((edge.get('node') or {}).get('entity') or {})
+            imdb_id = entity.get('id') or ''
+            image_url = (entity.get('primaryImage') or {}).get('url')
+            if kind == 'tt':
+                if not imdb_id.startswith('tt'):
+                    continue
+                title = (entity.get('titleText') or {}).get('text')
+                if not title:
+                    continue
+                data = {'title': title}
+                release_year = entity.get('releaseYear') or {}
+                release_date = entity.get('releaseDate') or {}
+                if release_year.get('year'):
+                    data['year'] = release_year['year']
+                elif release_date.get('year'):
+                    data['year'] = release_date['year']
+                type_id = (entity.get('titleType') or {}).get('id')
+                if type_id in kind_map:
+                    data['kind'] = kind_map[type_id]
+                rating = (entity.get('ratingsSummary') or {}).get('aggregateRating')
+                if rating is not None:
+                    data['rating'] = rating
+                runtime = entity.get('runtime') or {}
+                if runtime.get('seconds'):
+                    data['runtimes'] = [str(int(runtime['seconds'] / 60))]
+                if image_url:
+                    data['cover url'] = image_url
+                    data['full-size cover url'] = image_url
+                parsed.append((imdb_id[2:], data))
+            elif kind == 'nm':
+                if not imdb_id.startswith('nm'):
+                    continue
+                name = (entity.get('nameText') or {}).get('text')
+                if not name:
+                    continue
+                data = analyze_name(name, canonical=1)
+                if image_url:
+                    data['headshot'] = image_url
+                parsed.append((imdb_id[2:], data))
             if len(parsed) >= results:
                 break
         return parsed
@@ -864,9 +972,15 @@ class IMDbHTTPAccessSystem(IMDbBase):
         try:
             cont = self._get_search_content('tt', title, results)
         except IMDbDataAccessError:
-            return self._search_suggestion(title, 'tt', results)
+            if USE_IMDB_SUGGESTION_SEARCH:
+                return self._search_suggestion(title, 'tt', results)
+            return self._search_graphql(title, 'tt', results)
         data = self.smProxy.search_movie_parser.parse(cont, results=results)['data']
-        return data or self._search_suggestion(title, 'tt', results)
+        if data:
+            return data
+        if USE_IMDB_SUGGESTION_SEARCH:
+            return self._search_suggestion(title, 'tt', results)
+        return self._search_graphql(title, 'tt', results)
 
     def _get_list_content(self, list_, page):
         """Retrieve a list by it's id"""
@@ -955,7 +1069,12 @@ class IMDbHTTPAccessSystem(IMDbBase):
         if t_dict['kind'] == 'episode':
             title = t_dict['title']
         cont = self._get_search_content('ep', title, results)
-        return self.smProxy.search_movie_parser.parse(cont, results=results)['data']
+        data = self.smProxy.search_movie_parser.parse(cont, results=results)['data']
+        if data:
+            return data
+        if USE_IMDB_SUGGESTION_SEARCH:
+            return self._search_suggestion(title, 'tt', results)
+        return self._search_graphql(title, 'tt', results)
 
     def get_movie_main(self, movieID):
         try:
@@ -1217,9 +1336,15 @@ class IMDbHTTPAccessSystem(IMDbBase):
         try:
             cont = self._get_search_content('nm', name, results)
         except IMDbDataAccessError:
-            return self._search_suggestion(name, 'nm', results)
+            if USE_IMDB_SUGGESTION_SEARCH:
+                return self._search_suggestion(name, 'nm', results)
+            return self._search_graphql(name, 'nm', results)
         data = self.spProxy.search_person_parser.parse(cont, results=results)['data']
-        return data or self._search_suggestion(name, 'nm', results)
+        if data:
+            return data
+        if USE_IMDB_SUGGESTION_SEARCH:
+            return self._search_suggestion(name, 'nm', results)
+        return self._search_graphql(name, 'nm', results)
 
     def get_person_main(self, personID):
         try:
