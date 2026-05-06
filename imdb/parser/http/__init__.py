@@ -24,7 +24,9 @@ called with the ``accessSystem`` argument is set to "http" or "web"
 or "html" (this is the default).
 """
 
+import html as html_lib
 import json
+import re
 import ssl
 import warnings
 from codecs import lookup
@@ -41,6 +43,7 @@ from imdb import IMDbBase
 from imdb._exceptions import IMDbDataAccessError, IMDbParserError
 from imdb.parser.http.logging import logger
 from imdb.utils import analyze_company_name, analyze_name, analyze_title
+from .utils import build_movie
 from . import (
     companyParser,
     listParser,
@@ -590,6 +593,248 @@ class IMDbHTTPAccessSystem(IMDbBase):
             data['certificates'] = [certificate]
         return data
 
+    def _post_graphql(self, query, query_term):
+        """Run a GraphQL query against IMDb and return the decoded payload."""
+        payload = json.dumps({'query': query}).encode('utf8')
+        req = Request(
+            'https://api.graphql.imdb.com/',
+            data=payload,
+            headers={
+                'Content-Type': 'application/json',
+                'User-Agent': self.urlOpener.get_header('User-Agent') or 'Mozilla/5.0',
+                'Accept-Language': self.urlOpener.get_header('Accept-Language') or 'en-us,en;q=0.5',
+                'x-imdb-user-country': 'US',
+            },
+        )
+        try:
+            response = build_opener().open(req, timeout=self.timeout)
+            content = response.read()
+            response.close()
+            data = json.loads(content.decode('utf8'))
+        except Exception:
+            self._http_logger.warn('unable to use IMDb GraphQL for %s',
+                                   query_term, exc_info=True)
+            return {}
+        if data.get('errors'):
+            self._http_logger.warn('IMDb GraphQL returned errors for %s: %s',
+                                   query_term, data.get('errors'))
+            return {}
+        return data
+
+    def _plain_text(self, value):
+        """Convert IMDb plaidHtml/plain text fragments to a compact string."""
+        if not value:
+            return ''
+        value = re.sub(r'<br\s*/?>', '\n', value)
+        value = re.sub(r'<[^>]+>', '', value)
+        value = html_lib.unescape(value)
+        return re.sub(r'[ \t\r\f\v]+', ' ', value).strip()
+
+    def _get_movie_graphql_extended(self, movieID):
+        """Fetch GraphQL-only title extras used as HTML fallbacks."""
+        imdb_id = 'tt%s' % movieID
+        query = """
+        query {
+          title(id: "%s") {
+            id
+            interests(first: 20) {
+              edges { node { primaryText { text } } }
+            }
+            akas(first: 200) {
+              edges {
+                node {
+                  country { name: text code: id }
+                  language { name: text code: id }
+                  title: text
+                }
+              }
+            }
+            trivia(first: 50) {
+              edges {
+                node {
+                  id
+                  displayableArticle { body { plaidHtml } }
+                  interestScore { usersVoted usersInterested }
+                }
+              }
+            }
+            reviews(first: 50) {
+              edges {
+                node {
+                  id
+                  spoiler
+                  author { nickName }
+                  summary { originalText }
+                  text { originalText { plaidHtml } }
+                  authorRating
+                  submissionDate
+                  helpfulness { upVotes downVotes }
+                }
+              }
+            }
+            parentsGuide {
+              categories {
+                category { id text }
+                guideItems(first: 10) {
+                  edges { node { isSpoiler text { plaidHtml } } }
+                }
+                severity { id votedFor }
+                severityBreakdown { votedFor voteType }
+              }
+            }
+          }
+        }
+        """ % imdb_id
+        data = self._post_graphql(query, imdb_id)
+        return data.get('data', {}).get('title') or {}
+
+    def _graphql_akas_data(self, movieID):
+        raw = self._get_movie_graphql_extended(movieID)
+        akas = []
+        raw_akas = []
+        for edge in (raw.get('akas') or {}).get('edges') or []:
+            node = edge.get('node') or {}
+            title = node.get('title')
+            if not title:
+                continue
+            country = (node.get('country') or {}).get('name')
+            language = (node.get('language') or {}).get('name')
+            if country:
+                akas.append('%s (%s)' % (title, country))
+            else:
+                akas.append(title)
+            raw_akas.append({
+                'title': title,
+                'country': country,
+                'language': language,
+            })
+        data = {}
+        if akas:
+            data['akas'] = data['akas from release info'] = akas
+            data['raw akas'] = raw_akas
+        return {'data': data, 'info sets': ('release dates', 'akas')}
+
+    def _graphql_trivia_data(self, movieID):
+        raw = self._get_movie_graphql_extended(movieID)
+        trivia = []
+        for edge in (raw.get('trivia') or {}).get('edges') or []:
+            body = (((edge.get('node') or {}).get('displayableArticle') or {})
+                    .get('body') or {}).get('plaidHtml')
+            text = self._plain_text(body)
+            if text:
+                trivia.append(text)
+        return {'data': {'trivia': trivia} if trivia else {}, 'info sets': ('trivia',)}
+
+    def _graphql_reviews_data(self, movieID):
+        raw = self._get_movie_graphql_extended(movieID)
+        reviews = []
+        for edge in (raw.get('reviews') or {}).get('edges') or []:
+            node = edge.get('node') or {}
+            content = self._plain_text(
+                ((node.get('text') or {}).get('originalText') or {}).get('plaidHtml')
+            )
+            if not content:
+                continue
+            helpfulness = node.get('helpfulness') or {}
+            reviews.append({
+                'content': content,
+                'title': ((node.get('summary') or {}).get('originalText') or '').strip(),
+                'author': None,
+                'author_name': ((node.get('author') or {}).get('nickName') or '').strip(),
+                'date': node.get('submissionDate'),
+                'rating': node.get('authorRating'),
+                'helpful': helpfulness.get('upVotes') or 0,
+                'not_helpful': helpfulness.get('downVotes') or 0,
+            })
+        return {'data': {'reviews': reviews} if reviews else {}, 'info sets': ('reviews',)}
+
+    def _graphql_parental_guide_data(self, movieID):
+        raw = self._get_movie_graphql_extended(movieID)
+        data = {}
+        for category in ((raw.get('parentsGuide') or {}).get('categories') or []):
+            name = ((category.get('category') or {}).get('text') or '').lower()
+            if not name:
+                continue
+            key = 'advisory %s' % name.replace('&', 'and')
+            items = []
+            for edge in (category.get('guideItems') or {}).get('edges') or []:
+                text = self._plain_text(((edge.get('node') or {}).get('text') or {}).get('plaidHtml'))
+                if text:
+                    items.append(text)
+            if items:
+                data[key] = items
+            severity = category.get('severity') or {}
+            if severity.get('id'):
+                data.setdefault('advisory votes', {})[name] = {
+                    'status': severity.get('id'),
+                    'votes': severity.get('votedFor'),
+                }
+        return {'data': data, 'info sets': ('parents guide',)}
+
+    def _graphql_person_filmography_data(self, personID):
+        imdb_id = 'nm%s' % personID
+        query = """
+        query {
+          name(id: "%s") {
+            nameText { text }
+            credits(first: 250) {
+              edges {
+                node {
+                  category { id }
+                  title {
+                    id
+                    ratingsSummary { aggregateRating }
+                    primaryImage { url }
+                    originalTitleText { text }
+                    titleText { text }
+                    titleType { id }
+                    releaseYear { year }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """ % imdb_id
+        payload = self._post_graphql(query, imdb_id)
+        raw = payload.get('data', {}).get('name') or {}
+        filmo = {}
+        for edge in (raw.get('credits') or {}).get('edges') or []:
+            node = edge.get('node') or {}
+            title = node.get('title') or {}
+            title_id = title.get('id') or ''
+            if not title_id.startswith('tt'):
+                continue
+            role = (node.get('category') or {}).get('id') or 'unknown'
+            title_text = ((title.get('titleText') or {}).get('text') or
+                          (title.get('originalTitleText') or {}).get('text') or '')
+            if not title_text:
+                continue
+            year = (title.get('releaseYear') or {}).get('year')
+            movie = build_movie(title_text, movieID=title_id[2:], year=str(year) if year else None)
+            type_id = (title.get('titleType') or {}).get('id')
+            kind_map = {
+                'movie': 'movie',
+                'tvMovie': 'tv movie',
+                'tvSeries': 'tv series',
+                'tvMiniSeries': 'tv mini series',
+                'tvEpisode': 'episode',
+                'video': 'video movie',
+                'videoGame': 'video game',
+                'short': 'short',
+            }
+            if type_id in kind_map:
+                movie['kind'] = kind_map[type_id]
+            rating = (title.get('ratingsSummary') or {}).get('aggregateRating')
+            if rating is not None:
+                movie['rating'] = rating
+            image = (title.get('primaryImage') or {}).get('url')
+            if image:
+                movie['cover url'] = image
+            filmo.setdefault(role, []).append(movie)
+        return {'data': {'filmography': filmo} if filmo else {},
+                'info sets': ('filmography',)}
+
     def _get_search_content(self, kind, ton, results):
         """Retrieve the web page for a given search.
         kind can be 'tt' (for titles), 'nm' (for names),
@@ -779,9 +1024,14 @@ class IMDbHTTPAccessSystem(IMDbBase):
         return self.mProxy.quotes_parser.parse(cont, getRefs=self._getRefs)
 
     def get_movie_release_dates(self, movieID):
-        cont = self._retrieve(self.urls['movie_main'] % movieID + 'releaseinfo')
+        cont = self._retrieve(self.urls['movie_main'] % movieID + 'releaseinfo',
+                              _allowWaf=True)
+        if self.urlOpener._last_waf_action:
+            return self._graphql_akas_data(movieID)
         ret = self.mProxy.releasedates_parser.parse(cont)
         ret['info sets'] = ('release dates', 'akas')
+        if not ret.get('data'):
+            return self._graphql_akas_data(movieID)
         return ret
 
     get_movie_akas = get_movie_release_dates
@@ -796,8 +1046,15 @@ class IMDbHTTPAccessSystem(IMDbBase):
         return self.mProxy.ratings_parser.parse(cont)
 
     def get_movie_trivia(self, movieID):
-        cont = self._retrieve(self.urls['movie_main'] % movieID + 'trivia')
-        return self.mProxy.trivia_parser.parse(cont, getRefs=self._getRefs)
+        cont = self._retrieve(self.urls['movie_main'] % movieID + 'trivia',
+                              _allowWaf=True)
+        if self.urlOpener._last_waf_action:
+            return self._graphql_trivia_data(movieID)
+        ret = self.mProxy.trivia_parser.parse(cont, getRefs=self._getRefs)
+        ret['info sets'] = ('trivia',)
+        if not ret.get('data'):
+            return self._graphql_trivia_data(movieID)
+        return ret
 
     def get_movie_connections(self, movieID):
         cont = self._retrieve(self.urls['movie_main'] % movieID + 'movieconnections')
@@ -816,8 +1073,15 @@ class IMDbHTTPAccessSystem(IMDbBase):
         return self.mProxy.soundtrack_parser.parse(cont)
 
     def get_movie_reviews(self, movieID):
-        cont = self._retrieve(self.urls['movie_main'] % movieID + 'reviews?count=9999999&start=0')
-        return self.mProxy.reviews_parser.parse(cont)
+        cont = self._retrieve(self.urls['movie_main'] % movieID + 'reviews?count=9999999&start=0',
+                              _allowWaf=True)
+        if self.urlOpener._last_waf_action:
+            return self._graphql_reviews_data(movieID)
+        ret = self.mProxy.reviews_parser.parse(cont)
+        ret['info sets'] = ('reviews',)
+        if not ret.get('data'):
+            return self._graphql_reviews_data(movieID)
+        return ret
 
     def get_movie_critic_reviews(self, movieID):
         cont = self._retrieve(self.urls['movie_main'] % movieID + 'criticreviews')
@@ -939,8 +1203,15 @@ class IMDbHTTPAccessSystem(IMDbBase):
         return self.get_movie_plot(movieID)
 
     def get_movie_parents_guide(self, movieID):
-        cont = self._retrieve(self.urls['movie_main'] % movieID + 'parentalguide')
-        return self.mProxy.parentsguide_parser.parse(cont)
+        cont = self._retrieve(self.urls['movie_main'] % movieID + 'parentalguide',
+                              _allowWaf=True)
+        if self.urlOpener._last_waf_action:
+            return self._graphql_parental_guide_data(movieID)
+        ret = self.mProxy.parentsguide_parser.parse(cont)
+        ret['info sets'] = ('parents guide',)
+        if not ret.get('data'):
+            return self._graphql_parental_guide_data(movieID)
+        return ret
 
     def _search_person(self, name, results):
         try:
@@ -968,8 +1239,12 @@ class IMDbHTTPAccessSystem(IMDbBase):
         cont = self._retrieve(self.urls['person_main'] % personID + 'fullcredits',
                               _allowWaf=True)
         if self.urlOpener._last_waf_action:
-            return {'data': {}, 'info sets': ('filmography',)}
-        return self.pProxy.filmo_parser.parse(cont, getRefs=self._getRefs)
+            return self._graphql_person_filmography_data(personID)
+        ret = self.pProxy.filmo_parser.parse(cont, getRefs=self._getRefs)
+        ret['info sets'] = ('filmography',)
+        if not ret.get('data'):
+            return self._graphql_person_filmography_data(personID)
+        return ret
 
     def get_person_biography(self, personID):
         cont = self._retrieve(self.urls['person_main'] % personID + 'bio',
