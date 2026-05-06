@@ -26,6 +26,7 @@ or "html" (this is the default).
 
 import html as html_lib
 import json
+import os
 import re
 import ssl
 import warnings
@@ -61,8 +62,16 @@ from . import (
 # Logger for miscellaneous functions.
 _aux_logger = logger.getChild('aux')
 
-# Set this to False to test GraphQL search results without IMDb suggestion JSON.
-USE_IMDB_SUGGESTION_SEARCH = True
+def _env_bool(name, default=True):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# Set USE_IMDB_SUGGESTION_SEARCH=False to test GraphQL search results
+# without IMDb suggestion JSON.
+USE_IMDB_SUGGESTION_SEARCH = _env_bool('USE_IMDB_SUGGESTION_SEARCH', True)
 
 
 class _ModuleProxy:
