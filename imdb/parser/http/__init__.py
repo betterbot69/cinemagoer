@@ -26,7 +26,6 @@ or "html" (this is the default).
 
 import html as html_lib
 import json
-import os
 import re
 import ssl
 import warnings
@@ -61,17 +60,6 @@ from . import (
 
 # Logger for miscellaneous functions.
 _aux_logger = logger.getChild('aux')
-
-def _env_bool(name, default=True):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ('1', 'true', 'yes', 'on')
-
-
-# Set USE_IMDB_SUGGESTION_SEARCH=False to test GraphQL search results
-# without IMDb suggestion JSON.
-USE_IMDB_SUGGESTION_SEARCH = _env_bool('USE_IMDB_SUGGESTION_SEARCH', True)
 
 
 class _ModuleProxy:
@@ -473,7 +461,7 @@ class IMDbHTTPAccessSystem(IMDbBase):
                 break
         return parsed
 
-    def _search_graphql(self, query_text, kind, results):
+    def _search_graphql(self, query_text, kind, results, prefer_original_title=False):
         """Fallback search using IMDb's GraphQL mainSearch endpoint."""
         search_types = {'tt': 'TITLE', 'nm': 'NAME'}.get(kind)
         if not search_types:
@@ -541,10 +529,18 @@ class IMDbHTTPAccessSystem(IMDbBase):
             if kind == 'tt':
                 if not imdb_id.startswith('tt'):
                     continue
-                title = (entity.get('titleText') or {}).get('text')
+                title_text = (entity.get('titleText') or {}).get('text')
+                original_title = (entity.get('originalTitleText') or {}).get('text')
+                title = title_text
+                if prefer_original_title:
+                    title = original_title or title_text
                 if not title:
                     continue
                 data = {'title': title}
+                if title_text and title_text != title:
+                    data['localized title'] = title_text
+                if original_title and original_title != title:
+                    data['original title'] = original_title
                 release_year = entity.get('releaseYear') or {}
                 release_date = entity.get('releaseDate') or {}
                 if release_year.get('year'):
@@ -577,6 +573,32 @@ class IMDbHTTPAccessSystem(IMDbBase):
             if len(parsed) >= results:
                 break
         return parsed
+
+    def _merge_search_results(self, primary, extra, results):
+        """Merge search result tuples while preserving same-id alternate titles."""
+        merged = []
+        seen = set()
+        max_results = max(results, 1) * 2
+        for movieID, data in (primary or []) + (extra or []):
+            title = (data or {}).get('title') or ''
+            key = (movieID, title.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((movieID, data))
+            if len(merged) >= max_results:
+                break
+        return merged
+
+    def _search_suggestion_with_originals(self, query, kind, results):
+        """IMDb suggestion JSON plus IMDBKit-style GraphQL original-title matches."""
+        suggestion = self._search_suggestion(query, kind, results)
+        if kind != 'tt':
+            return suggestion
+        graphql = self._search_graphql(
+            query, kind, results, prefer_original_title=True
+        )
+        return self._merge_search_results(suggestion, graphql, results)
 
     def _get_movie_graphql(self, movieID):
         """Fetch core title data from IMDb's GraphQL endpoint."""
@@ -981,15 +1003,11 @@ class IMDbHTTPAccessSystem(IMDbBase):
         try:
             cont = self._get_search_content('tt', title, results)
         except IMDbDataAccessError:
-            if USE_IMDB_SUGGESTION_SEARCH:
-                return self._search_suggestion(title, 'tt', results)
-            return self._search_graphql(title, 'tt', results)
+            return self._search_suggestion_with_originals(title, 'tt', results)
         data = self.smProxy.search_movie_parser.parse(cont, results=results)['data']
         if data:
             return data
-        if USE_IMDB_SUGGESTION_SEARCH:
-            return self._search_suggestion(title, 'tt', results)
-        return self._search_graphql(title, 'tt', results)
+        return self._search_suggestion_with_originals(title, 'tt', results)
 
     def _get_list_content(self, list_, page):
         """Retrieve a list by it's id"""
@@ -1081,9 +1099,7 @@ class IMDbHTTPAccessSystem(IMDbBase):
         data = self.smProxy.search_movie_parser.parse(cont, results=results)['data']
         if data:
             return data
-        if USE_IMDB_SUGGESTION_SEARCH:
-            return self._search_suggestion(title, 'tt', results)
-        return self._search_graphql(title, 'tt', results)
+        return self._search_suggestion_with_originals(title, 'tt', results)
 
     def get_movie_main(self, movieID):
         try:
@@ -1345,15 +1361,11 @@ class IMDbHTTPAccessSystem(IMDbBase):
         try:
             cont = self._get_search_content('nm', name, results)
         except IMDbDataAccessError:
-            if USE_IMDB_SUGGESTION_SEARCH:
-                return self._search_suggestion(name, 'nm', results)
-            return self._search_graphql(name, 'nm', results)
+            return self._search_suggestion(name, 'nm', results)
         data = self.spProxy.search_person_parser.parse(cont, results=results)['data']
         if data:
             return data
-        if USE_IMDB_SUGGESTION_SEARCH:
-            return self._search_suggestion(name, 'nm', results)
-        return self._search_graphql(name, 'nm', results)
+        return self._search_suggestion(name, 'nm', results)
 
     def get_person_main(self, personID):
         try:
