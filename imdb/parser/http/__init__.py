@@ -574,7 +574,35 @@ class IMDbHTTPAccessSystem(IMDbBase):
                 break
         return parsed
 
-    def _merge_search_results(self, primary, extra, results):
+    def _search_result_score(self, query, movieID, data, position):
+        """Score merged search results so closest title matches appear first."""
+        query_l = (query or '').lower().strip()
+        query_clean = re.sub(r'[^a-z0-9]', '', query_l)
+        title = ((data or {}).get('title') or '').strip()
+        title_l = title.lower()
+        title_clean = re.sub(r'[^a-z0-9]', '', title_l)
+
+        score = 0
+        if title_clean and title_clean == query_clean:
+            score += 10000
+        elif title_clean and title_clean.startswith(query_clean):
+            score += 7000
+        elif query_clean and query_clean in title_clean:
+            score += 4000
+        elif title_clean and title_clean in query_clean:
+            score += 3000
+
+        query_year = re.search(r'(?:19|20)\d{2}', query_l)
+        query_year = query_year.group(0) if query_year else None
+        if query_year and str((data or {}).get('year') or '') == query_year:
+            score += 8000
+
+        if (data or {}).get('localized title'):
+            score += 50
+
+        return score - position
+
+    def _merge_search_results(self, primary, extra, results, query=None):
         """Merge search result tuples while preserving same-id alternate titles."""
         merged = []
         seen = set()
@@ -588,6 +616,18 @@ class IMDbHTTPAccessSystem(IMDbBase):
             merged.append((movieID, data))
             if len(merged) >= max_results:
                 break
+        if query:
+            merged = [
+                item for _, item in sorted(
+                    (
+                        (self._search_result_score(query, movieID, data, pos),
+                         (movieID, data))
+                        for pos, (movieID, data) in enumerate(merged)
+                    ),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+            ]
         return merged
 
     def _search_suggestion_with_originals(self, query, kind, results):
@@ -598,7 +638,7 @@ class IMDbHTTPAccessSystem(IMDbBase):
         graphql = self._search_graphql(
             query, kind, results, prefer_original_title=True
         )
-        return self._merge_search_results(suggestion, graphql, results)
+        return self._merge_search_results(suggestion, graphql, results, query=query)
 
     def _get_movie_graphql(self, movieID):
         """Fetch core title data from IMDb's GraphQL endpoint."""
