@@ -41,6 +41,7 @@ from urllib.request import (
 
 from imdb import IMDbBase
 from imdb._exceptions import IMDbDataAccessError, IMDbParserError
+from imdb.Movie import Movie
 from imdb.parser.http.logging import logger
 from imdb.utils import analyze_company_name, analyze_name, analyze_title
 from .utils import build_movie
@@ -432,19 +433,25 @@ class IMDbHTTPAccessSystem(IMDbBase):
                 data['title'] = label
                 if item.get('y'):
                     data['year'] = item['y']
-                qid = item.get('qid') or item.get('q')
+                qid = (item.get('qid') or item.get('q') or '').strip()
                 kind_map = {
                     'movie': 'movie',
-                    'tvMovie': 'tv movie',
-                    'tvSeries': 'tv series',
-                    'tvMiniSeries': 'tv mini series',
-                    'tvEpisode': 'episode',
+                    'tvmovie': 'tv movie',
+                    'tv movie': 'tv movie',
+                    'tvseries': 'tv series',
+                    'tv series': 'tv series',
+                    'tvminiseries': 'tv mini series',
+                    'tv mini series': 'tv mini series',
+                    'tvepisode': 'episode',
+                    'tv episode': 'episode',
                     'video': 'video movie',
-                    'videoGame': 'video game',
+                    'videogame': 'video game',
+                    'video game': 'video game',
                     'short': 'short',
                 }
-                if qid in kind_map:
-                    data['kind'] = kind_map[qid]
+                qid_key = qid.replace('-', '').replace('_', '').lower()
+                if qid_key in kind_map:
+                    data['kind'] = kind_map[qid_key]
                 if image_url:
                     data['cover url'] = image_url
                     data['full-size cover url'] = image_url
@@ -1328,8 +1335,141 @@ class IMDbHTTPAccessSystem(IMDbBase):
             del data_d['data']['_seasons']
         return data_d
 
+    def _get_movie_episodes_graphql(self, movieID, season_nums='all'):
+        """Fetch series episodes from IMDb GraphQL when the episodes page is WAF-blocked."""
+        imdb_id = 'tt%s' % movieID
+        query = """
+        query {
+          title(id: "%s") {
+            id
+            titleText { text }
+            originalTitleText { text }
+            episodes {
+              displayableSeasons(first: 100) {
+                edges {
+                  node { season }
+                }
+              }
+              episodes(first: 250) {
+                total
+                edges {
+                  node {
+                    id
+                    titleText { text }
+                    releaseDate { year month day }
+                    ratingsSummary { aggregateRating voteCount }
+                    plot { plotText { plainText } }
+                    series {
+                      episodeNumber { seasonNumber episodeNumber }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """ % imdb_id
+        payload = self._post_graphql(query, imdb_id)
+        title = ((payload.get('data') or {}).get('title') or {})
+        episodes_data = title.get('episodes') or {}
+        edges = ((episodes_data.get('episodes') or {}).get('edges') or [])
+        if not edges:
+            return {'data': {'episodes': {}, 'number of episodes': 0}}
+
+        if isinstance(season_nums, int):
+            season_nums = {season_nums}
+        elif (isinstance(season_nums, (list, tuple)) or
+              not hasattr(season_nums, '__contains__')):
+            season_nums = set(season_nums)
+
+        series_title = ((title.get('originalTitleText') or {}).get('text') or
+                        (title.get('titleText') or {}).get('text') or '')
+        series = Movie(title=series_title, movieID=str(movieID),
+                       accessSystem=self.accessSystem,
+                       modFunct=self._defModFunct)
+        series['kind'] = 'tv series'
+
+        seasons = set()
+        episodes = {}
+        nr_eps = 0
+        for edge in edges:
+            node = ((edge.get('node') or {}))
+            episode_id = (node.get('id') or '')
+            if not episode_id.startswith('tt'):
+                continue
+            episode_number = (((node.get('series') or {}).get('episodeNumber') or {}))
+            season = episode_number.get('seasonNumber')
+            episode = episode_number.get('episodeNumber')
+            if season is None or episode is None:
+                continue
+            try:
+                season = int(season)
+                episode = int(episode)
+            except Exception:
+                continue
+            if season_nums != 'all' and season not in season_nums:
+                continue
+
+            episode_title = (node.get('titleText') or {}).get('text')
+            if not episode_title:
+                continue
+            ep_obj = Movie(movieID=episode_id[2:], title=episode_title,
+                           accessSystem=self.accessSystem,
+                           modFunct=self._defModFunct)
+            ep_obj['kind'] = 'episode'
+            ep_obj['episode of'] = series
+            ep_obj['season'] = season
+            ep_obj['episode'] = episode
+
+            release_date = node.get('releaseDate') or {}
+            if release_date.get('year'):
+                ep_obj['year'] = release_date['year']
+                parts = [
+                    str(release_date.get('year')),
+                    '%02d' % release_date.get('month') if release_date.get('month') else '',
+                    '%02d' % release_date.get('day') if release_date.get('day') else '',
+                ]
+                ep_obj['original air date'] = '-'.join([p for p in parts if p])
+
+            ratings = node.get('ratingsSummary') or {}
+            if ratings.get('aggregateRating') is not None:
+                ep_obj['rating'] = ratings['aggregateRating']
+            if ratings.get('voteCount') is not None:
+                ep_obj['votes'] = ratings['voteCount']
+            plot = ((node.get('plot') or {}).get('plotText') or {}).get('plainText')
+            if plot:
+                ep_obj['plot'] = plot
+
+            episodes.setdefault(season, {})[episode] = ep_obj
+            seasons.add(season)
+            nr_eps += 1
+
+        season_edges = ((episodes_data.get('displayableSeasons') or {}).get('edges') or [])
+        if season_edges:
+            try:
+                seasons.update(
+                    int((edge.get('node') or {}).get('season'))
+                    for edge in season_edges
+                    if (edge.get('node') or {}).get('season')
+                )
+            except Exception:
+                pass
+        return {
+            'data': {
+                'episodes': episodes,
+                '_seasons': sorted(seasons),
+                'number of episodes': nr_eps,
+            }
+        }
+
     def get_movie_episodes(self, movieID, season_nums='all'):
-        cont = self._retrieve(self.urls['movie_main'] % movieID + 'episodes')
+        try:
+            cont = self._retrieve(self.urls['movie_main'] % movieID + 'episodes',
+                                  _allowWaf=True)
+        except IMDbDataAccessError:
+            return self._get_movie_episodes_graphql(movieID, season_nums)
+        if self.urlOpener._last_waf_action:
+            return self._get_movie_episodes_graphql(movieID, season_nums)
         temp_d = self.mProxy.season_episodes_parser.parse(cont)
         if isinstance(season_nums, int):
             season_nums = {season_nums}
