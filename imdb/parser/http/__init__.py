@@ -30,6 +30,7 @@ import re
 import ssl
 import warnings
 from codecs import lookup
+from difflib import SequenceMatcher
 from urllib.parse import quote, quote_plus
 from urllib.request import (
     HTTPRedirectHandler,
@@ -598,6 +599,10 @@ class IMDbHTTPAccessSystem(IMDbBase):
             score += 4000
         elif title_clean and title_clean in query_clean:
             score += 3000
+        elif query_clean and title_clean:
+            ratio = SequenceMatcher(None, query_clean, title_clean).ratio()
+            if ratio >= 0.70:
+                score += int(ratio * 3500)
 
         query_year = re.search(r'(?:19|20)\d{2}', query_l)
         query_year = query_year.group(0) if query_year else None
